@@ -104,7 +104,8 @@ export async function POST(request: NextRequest) {
         );
     }
 
-    return new NextResponse(processedBuffer, {
+    // Convert Buffer to Uint8Array for NextResponse compatibility
+    return new NextResponse(new Uint8Array(processedBuffer), {
       headers: {
         'Content-Type': 'image/jpeg',
         'Content-Disposition': `attachment; filename="instagram-enhanced-${Date.now()}.jpg"`,
