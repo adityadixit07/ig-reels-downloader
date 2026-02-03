@@ -194,11 +194,35 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
           const jsonMatch = scriptContent.match(/window\._sharedData\s*=\s*({.+?});/s);
           if (jsonMatch) {
             const data = JSON.parse(jsonMatch[1]);
-            const postData = data?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
+            
+            // Try PostPage first
+            let postData = data?.entry_data?.PostPage?.[0]?.graphql?.shortcode_media;
+            
+            // Try ReelPage for reels
+            if (!postData && isReel) {
+              postData = data?.entry_data?.ReelPage?.[0]?.graphql?.reel;
+            }
             
             if (postData) {
-              mediaData = extractMediaFromGraphQL(postData);
-              return false; // Break loop
+              // For reels, ensure we get video_url directly
+              if (isReel && postData.video_url) {
+                mediaData = {
+                  media: [{
+                    url: postData.video_url,
+                    type: 'video',
+                    thumbnail: postData.display_url || postData.cover_photo?.url || postData.thumbnail_src,
+                    caption: postData.edge_media_to_caption?.edges?.[0]?.node?.text || postData.title,
+                  }],
+                  username: postData.owner?.username || extractUsernameFromUrl(cleanUrl),
+                  timestamp: postData.taken_at_timestamp?.toString(),
+                };
+              } else {
+                mediaData = extractMediaFromGraphQL(postData);
+              }
+              
+              if (mediaData) {
+                return false; // Break loop
+              }
             }
           }
         } catch (e) {
@@ -229,6 +253,9 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
         }
       });
     }
+
+    // Check if this is a reel URL - reels are always videos (declare early)
+    const isReel = cleanUrl.includes('/reel/');
 
     // Method 3: Extract from meta tags (most reliable for public posts)
     if (!mediaData) {
@@ -272,9 +299,6 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
         username = author.replace('@', '');
       }
       
-      // Check if this is a reel URL - reels are always videos
-      const isReel = cleanUrl.includes('/reel/');
-      
       // Check for video content
       if (isReel || ogVideoSecure || ogVideo || ogVideoUrl || ogVideoType) {
         // For videos/reels, try to get the actual video URL
@@ -293,33 +317,36 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
           });
         }
         
+        // Validate video URL - ensure it's not an image URL
         if (videoUrl) {
-          mediaData = {
-            media: [{
-              url: videoUrl,
-              type: 'video',
-              thumbnail: ogImage,
-              caption: ogDescription,
-            }],
-            username,
-          };
-        } else if (isReel && ogImage) {
-          // For reels, if we only have thumbnail, still mark as video
-          // The actual video URL might be in JavaScript
-          mediaData = {
-            media: [{
-              url: ogImage, // Will try to find video URL below
-              type: 'video',
-              thumbnail: ogImage,
-              caption: ogDescription,
-            }],
-            username,
-          };
+          // Check if URL is actually a video (not an image)
+          const isImageUrl = videoUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i);
+          const isVideoUrl = videoUrl.match(/\.(mp4|mov|webm|mkv)(\?|$)/i) || 
+                            videoUrl.includes('/video/') ||
+                            videoUrl.includes('video_url');
+          
+          // For reels, only accept if it's definitely a video URL
+          if (isReel && isImageUrl && !isVideoUrl) {
+            console.log('Reel URL detected as image, skipping...');
+            videoUrl = ''; // Clear invalid video URL
+          }
+          
+          if (videoUrl && (!isImageUrl || isVideoUrl)) {
+            mediaData = {
+              media: [{
+                url: videoUrl,
+                type: 'video',
+                thumbnail: ogImage,
+                caption: ogDescription,
+              }],
+              username,
+            };
+          }
         }
       }
       
-      // Check for image content
-      if (!mediaData && ogImage) {
+      // Check for image content (only if not a reel and no video found)
+      if (!mediaData && ogImage && !isReel) {
         // For images, try to get higher resolution
         let imageUrl = ogImage;
         
@@ -355,9 +382,44 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
     }
 
     // Method 4: Try to extract from embedded JSON in script tags (newer Instagram structure)
-    if (!mediaData) {
-      $('script').each((_, element) => {
-        const scriptContent = $(element).html() || '';
+    // For reels, prioritize video_url extraction
+    if (!mediaData || (isReel && mediaData.media[0]?.type !== 'video')) {
+      $('script').each((_, script) => {
+        const scriptContent = $(script).html() || '';
+        
+        // For reels, prioritize video_url extraction
+        if (isReel && scriptContent.includes('video_url')) {
+          try {
+            // Try multiple patterns to find video_url
+            const videoPatterns = [
+              /"video_url"\s*:\s*"([^"]+)"/g,
+              /"videoUrl"\s*:\s*"([^"]+)"/g,
+              /video_url["\s]*:["\s]*([^"}\s,]+)/g,
+            ];
+            
+            for (const pattern of videoPatterns) {
+              let match;
+              while ((match = pattern.exec(scriptContent)) !== null) {
+                const videoUrl = match[1].replace(/\\\//g, '/').replace(/\\u002F/g, '/');
+                // Validate it's a real video URL
+                if (videoUrl && (videoUrl.includes('cdninstagram.com') || videoUrl.includes('fbcdn') || videoUrl.includes('.mp4'))) {
+                  const ogImage = $('meta[property="og:image"]').attr('content') || '';
+                  mediaData = {
+                    media: [{
+                      url: videoUrl,
+                      type: 'video',
+                      thumbnail: ogImage,
+                    }],
+                    username: extractUsernameFromUrl(cleanUrl),
+                  };
+                  return false; // Break loop
+                }
+              }
+            }
+          } catch (e) {
+            // Continue searching
+          }
+        }
         
         // Look for JSON that might contain media URLs
         if (scriptContent.includes('display_url') || scriptContent.includes('video_url')) {
@@ -368,7 +430,11 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
               for (const match of jsonMatches) {
                 try {
                   const data = JSON.parse(match);
-                  if (data.display_url || data.video_url) {
+                  // For reels, only accept if it has video_url
+                  if (isReel && !data.video_url) {
+                    continue;
+                  }
+                  if (data.video_url || (!isReel && data.display_url)) {
                     mediaData = {
                       media: [{
                         url: data.video_url || data.display_url,
@@ -391,8 +457,11 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
       });
     }
 
-    // Check if this is a reel - prioritize video extraction
-    const isReel = cleanUrl.includes('/reel/');
+    // For reels, if we got an image instead of video, clear it and search again
+    if (isReel && mediaData && mediaData.media[0]?.type === 'image') {
+      console.log('Reel detected but got image URL, searching for video URL...');
+      mediaData = null; // Clear and search for video
+    }
     
     if (!mediaData || (isReel && mediaData.media[0]?.type !== 'video')) {
       // Last resort: Try to extract from any img or video tags directly
@@ -427,27 +496,146 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
         if (!videoSrc) {
           $('script').each((_, script) => {
             const scriptContent = $(script).html() || '';
-            // Look for video URLs in JSON
-            const videoUrlMatch = scriptContent.match(/"video_url"\s*:\s*"([^"]+)"/);
-            if (videoUrlMatch) {
-              videoSrc = videoUrlMatch[1].replace(/\\\//g, '/');
-              return false;
+            
+            // Look for video URLs in JSON - try multiple patterns
+            const patterns = [
+              /"video_url"\s*:\s*"([^"]+)"/g,
+              /"videoUrl"\s*:\s*"([^"]+)"/g,
+              /"video_url"\s*:\s*"([^"]*\.mp4[^"]*)"/g,
+              /"video_url"\s*:\s*"([^"]*cdninstagram[^"]*)"/g,
+              /video_url["\s]*:["\s]*"([^"]+)"/g,
+              /"playback_url"\s*:\s*"([^"]+)"/g, // Alternative Instagram field
+              /"video_versions"\s*:\s*\[[^\]]*"url"\s*:\s*"([^"]+)"/g, // Video versions array
+            ];
+            
+            for (const pattern of patterns) {
+              let match;
+              // Reset regex lastIndex for global patterns
+              pattern.lastIndex = 0;
+              while ((match = pattern.exec(scriptContent)) !== null) {
+                if (match[1]) {
+                  let url = match[1]
+                    .replace(/\\\//g, '/')
+                    .replace(/\\u002F/g, '/')
+                    .replace(/\\/g, '')
+                    .replace(/&amp;/g, '&')
+                    .trim();
+                  
+                  // Ensure it's a valid video URL - must be longer than thumbnail URLs
+                  if (url && url.length > 20 && (url.includes('cdninstagram.com') || url.includes('fbcdn') || url.includes('.mp4') || url.includes('video'))) {
+                    // Additional validation - reject image URLs aggressively
+                    const isImageUrl = url.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i);
+                    const hasVideoIndicator = url.includes('.mp4') || url.includes('/video/') || url.includes('video_url') || url.match(/\/v\/[^\/]+/);
+                    
+                    // For reels, only accept URLs that are clearly videos
+                    if (!isImageUrl || hasVideoIndicator) {
+                      // Additional check: reject URLs that look like thumbnails (usually shorter or contain 's150x150', 's640x640', etc.)
+                      const isThumbnail = url.match(/s\d+x\d+/i) && !hasVideoIndicator;
+                      if (!isThumbnail) {
+                        videoSrc = url;
+                        return false; // Break outer loop
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            
+            // Try to parse full JSON objects - look for larger JSON structures
+            try {
+              if (scriptContent.includes('video_url') || scriptContent.includes('videoUrl') || scriptContent.includes('playback_url')) {
+                // Try to find window._sharedData or similar large JSON objects
+                if (scriptContent.includes('window._sharedData')) {
+                  const sharedDataMatch = scriptContent.match(/window\._sharedData\s*=\s*({.+?});/s);
+                  if (sharedDataMatch) {
+                    try {
+                      const sharedData = JSON.parse(sharedDataMatch[1]);
+                      // Navigate through the structure to find video_url
+                      const findVideoUrl = (obj: any): string | null => {
+                        if (typeof obj !== 'object' || obj === null) return null;
+                        if (obj.video_url) return obj.video_url;
+                        if (obj.videoUrl) return obj.videoUrl;
+                        if (obj.playback_url) return obj.playback_url;
+                        for (const key in obj) {
+                          const result = findVideoUrl(obj[key]);
+                          if (result) return result;
+                        }
+                        return null;
+                      };
+                      const foundUrl = findVideoUrl(sharedData);
+                      if (foundUrl && (foundUrl.includes('cdninstagram.com') || foundUrl.includes('fbcdn') || foundUrl.includes('.mp4'))) {
+                        videoSrc = foundUrl;
+                        return false;
+                      }
+                    } catch (e) {
+                      // Continue
+                    }
+                  }
+                }
+                
+                // Try to extract JSON object containing video_url (more flexible pattern)
+                const jsonPatterns = [
+                  /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*"video_url"[^{}]*\}/,
+                  /\{[^{}]*(?:\{[^{}]*\}[^{}]*)*"playback_url"[^{}]*\}/,
+                  /"video_versions"\s*:\s*\[([^\]]+)\]/,
+                ];
+                
+                for (const jsonPattern of jsonPatterns) {
+                  const jsonMatch = scriptContent.match(jsonPattern);
+                  if (jsonMatch) {
+                    try {
+                      const jsonObj = JSON.parse(jsonMatch[0]);
+                      let url = jsonObj.video_url || jsonObj.videoUrl || jsonObj.playback_url;
+                      if (Array.isArray(jsonObj.video_versions) && jsonObj.video_versions[0]?.url) {
+                        url = jsonObj.video_versions[0].url;
+                      }
+                      if (url && (url.includes('cdninstagram.com') || url.includes('fbcdn') || url.includes('.mp4'))) {
+                        const isImageUrl = url.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i);
+                        if (!isImageUrl) {
+                          videoSrc = url;
+                          return false;
+                        }
+                      }
+                    } catch (e) {
+                      // Continue trying other patterns
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              // Continue searching
             }
           });
         }
         
+        // Validate video URL before using it
         if (videoSrc) {
-          // Get thumbnail from existing mediaData or meta tags
-          const ogImageThumb = $('meta[property="og:image"]').attr('content') || '';
-          const thumbnail = mediaData?.media[0]?.thumbnail || ogImageThumb || '';
-          mediaData = {
-            media: [{
-              url: videoSrc,
-              type: 'video',
-              thumbnail: thumbnail,
-            }],
-            username: extractUsernameFromUrl(cleanUrl),
-          };
+          // Ensure it's not an image URL
+          const isImageUrl = videoSrc.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i);
+          const isVideoUrl = videoSrc.match(/\.(mp4|mov|webm|mkv)(\?|$)/i) || 
+                            videoSrc.includes('/video/') ||
+                            videoSrc.includes('video_url') ||
+                            videoSrc.includes('video');
+          
+          // For reels, reject image URLs
+          if (isReel && isImageUrl && !isVideoUrl) {
+            console.log('Rejected image URL for reel:', videoSrc);
+            videoSrc = '';
+          }
+          
+          if (videoSrc && (!isImageUrl || isVideoUrl)) {
+            // Get thumbnail from existing mediaData or meta tags
+            const ogImageThumb = $('meta[property="og:image"]').attr('content') || '';
+            const thumbnail = mediaData?.media[0]?.thumbnail || ogImageThumb || '';
+            mediaData = {
+              media: [{
+                url: videoSrc,
+                type: 'video',
+                thumbnail: thumbnail,
+              }],
+              username: extractUsernameFromUrl(cleanUrl),
+            };
+          }
         }
       } else if (directImages.length > 0 && !isReel) {
         // Find the largest image
@@ -480,11 +668,28 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
       }
     }
 
+    // Final validation for reels - ensure we have a video URL
+    if (isReel && mediaData) {
+      const mediaUrl = mediaData.media[0]?.url || '';
+      const isImageUrl = mediaUrl.match(/\.(jpg|jpeg|png|webp|gif)(\?|$)/i);
+      const isVideoUrl = mediaUrl.match(/\.(mp4|mov|webm|mkv)(\?|$)/i) || 
+                        mediaUrl.includes('/video/') ||
+                        mediaUrl.includes('video');
+      
+      // If we got an image URL for a reel, it's invalid
+      if (isImageUrl && !isVideoUrl) {
+        console.log('Reel returned image URL instead of video, clearing...');
+        mediaData = null;
+      }
+    }
+
     if (!mediaData) {
       // Debug: Log what we found
       const debugInfo = {
+        isReel: isReel,
         hasOgImage: !!$('meta[property="og:image"]').attr('content'),
         hasOgVideo: !!$('meta[property="og:video"]').attr('content'),
+        hasOgVideoSecure: !!$('meta[property="og:video:secure_url"]').attr('content'),
         htmlLength: html.length,
         title: $('title').text(),
         hasLoginPage: html.includes('login') && html.includes('password'),
@@ -492,7 +697,11 @@ export async function scrapeInstagramPost(postUrl: string): Promise<InstagramPos
       
       console.log('Debug info:', debugInfo);
       
-      throw new Error('Could not extract media from Instagram post. The page structure may have changed, the post may be private, or Instagram is blocking access. Please ensure the account is public and try again.');
+      const errorMsg = isReel 
+        ? 'Could not extract video from this reel. Instagram may have changed their structure or the reel may be unavailable.'
+        : 'Could not extract media from Instagram post. The page structure may have changed, the post may be private, or Instagram is blocking access. Please ensure the account is public and try again.';
+      
+      throw new Error(errorMsg);
     }
 
     return mediaData;
@@ -509,11 +718,31 @@ function extractMediaFromGraphQL(postData: any): InstagramPost {
   const media: InstagramMedia[] = [];
   const username = postData.owner?.username || '';
 
-  if (postData.__typename === 'GraphSidecar') {
+  // Handle reel structure
+  if (postData.__typename === 'GraphReel' || postData.video_url) {
+    // Reel or video post
+    if (postData.video_url) {
+      media.push({
+        url: postData.video_url,
+        type: 'video',
+        thumbnail: postData.display_url || postData.cover_photo?.url || postData.thumbnail_src,
+        caption: postData.edge_media_to_caption?.edges?.[0]?.node?.text || postData.title,
+      });
+    } else if (postData.video_versions && Array.isArray(postData.video_versions) && postData.video_versions.length > 0) {
+      // Use first video version (usually highest quality)
+      const videoVersion = postData.video_versions[0];
+      media.push({
+        url: videoVersion.url,
+        type: 'video',
+        thumbnail: postData.display_url || postData.cover_photo?.url || postData.thumbnail_src,
+        caption: postData.edge_media_to_caption?.edges?.[0]?.node?.text || postData.title,
+      });
+    }
+  } else if (postData.__typename === 'GraphSidecar') {
     // Carousel post with multiple media
     postData.edge_sidecar_to_children?.edges?.forEach((edge: any) => {
       const node = edge.node;
-      if (node.is_video) {
+      if (node.is_video || node.video_url) {
         media.push({
           url: node.video_url,
           type: 'video',
@@ -526,14 +755,17 @@ function extractMediaFromGraphQL(postData: any): InstagramPost {
         });
       }
     });
-  } else if (postData.is_video) {
+  } else if (postData.is_video || postData.video_url) {
     // Single video/reel
-    media.push({
-      url: postData.video_url,
-      type: 'video',
-      thumbnail: postData.display_url,
-      caption: postData.edge_media_to_caption?.edges?.[0]?.node?.text,
-    });
+    const videoUrl = postData.video_url || (postData.video_versions?.[0]?.url);
+    if (videoUrl) {
+      media.push({
+        url: videoUrl,
+        type: 'video',
+        thumbnail: postData.display_url || postData.cover_photo?.url,
+        caption: postData.edge_media_to_caption?.edges?.[0]?.node?.text,
+      });
+    }
   } else {
     // Single image
     media.push({

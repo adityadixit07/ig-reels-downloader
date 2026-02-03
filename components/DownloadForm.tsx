@@ -147,15 +147,19 @@ export default function DownloadForm({ onDownload, loading }: DownloadFormProps)
             onChange={handleUrlChange}
             onPaste={(e) => {
               // Handle paste event to detect URL type immediately
-              setTimeout(() => {
-                const pastedUrl = e.currentTarget.value;
-                const detectedType = detectContentType(pastedUrl);
+              // Use clipboard data or wait for onChange to handle it
+              const pastedText = e.clipboardData?.getData('text') || '';
+              if (pastedText) {
+                const detectedType = detectContentType(pastedText);
                 if (detectedType) {
-                  setType(detectedType);
-                  setAutoDetected(true);
-                  setTimeout(() => setAutoDetected(false), 2000);
+                  // Small delay to let paste complete first
+                  setTimeout(() => {
+                    setType(detectedType);
+                    setAutoDetected(true);
+                    setTimeout(() => setAutoDetected(false), 2000);
+                  }, 10);
                 }
-              }, 0);
+              }
             }}
             placeholder="https://www.instagram.com/p/ABC123xyz/"
             className="w-full pl-10 sm:pl-12 pr-4 py-3 sm:py-4 border-2 border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none transition-all text-sm sm:text-base bg-white disabled:bg-gray-50 disabled:cursor-not-allowed"
