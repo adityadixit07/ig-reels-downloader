@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import axios from 'axios';
 import sharp from 'sharp';
 
+export const dynamic = 'force-dynamic';
+
 /**
  * Enhance image quality using Sharp (local processing)
  * For production, you might want to use an AI upscaling service

@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { scrapeInstagramPost, isPublicAccount } from '@/lib/instagram-scraper';
 
+export const dynamic = 'force-dynamic';
+
 export async function POST(request: NextRequest) {
   try {
     const { url } = await request.json();

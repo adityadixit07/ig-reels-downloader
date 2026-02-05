@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import DownloadForm from '@/components/DownloadForm';
 import MediaPreview from '@/components/MediaPreview';
+import Footer from '@/components/Footer';
 
 export default function Home() {
   const [downloadData, setDownloadData] = useState<any>(null);
@@ -169,6 +170,7 @@ export default function Home() {
           )}
         </div>
       </main>
+      <Footer />
     </>
   );
 }
